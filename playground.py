@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Type
 
 import pinecone
 import streamlit as st
@@ -10,7 +11,8 @@ from langchain.document_loaders import TextLoader, DirectoryLoader
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.llms import GPT4All as lang_GPT4All
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Pinecone
+from langchain.vectorstores import Pinecone, VectorStore
+from langchain.vectorstores.pgvector import PGVector
 
 
 def download_model(model_name: str, target_folder: str):
@@ -33,7 +35,6 @@ def download_model(model_name: str, target_folder: str):
 
 
 def get_llm(model_name, model_path="./models"):
-
     local_path = (model_path + "/" + model_name)
 
     if not os.path.exists(local_path):
@@ -63,19 +64,18 @@ def load_docs_and_generate_chunks(docs_dir='./data',
     return text_splitter.split_documents(documents)
 
 
-def get_vectorstore(index_name="langchain-demo",
-                    embeddings_cls=HuggingFaceEmbeddings,
-                    add_docs=False,
-                    docs_dir='./data',
-                    docs_ending="txt",
-                    pinecone_env=None,
-                    pinecone_key=None
-                    ):
-
-    embeddings = embeddings_cls()
+def _init_pinecone(embeddings,
+                   index_name,
+                   pinecone_env: str,
+                   pinecone_api_key: str,
+                   add_docs: bool = False,
+                   docs_dir: str = './data',
+                   docs_ending: str = "txt"
+                   ):
+    index_name = index_name
 
     pinecone.init(
-        api_key=pinecone_key,
+        api_key=pinecone_api_key,
         environment=pinecone_env
     )
 
@@ -98,6 +98,48 @@ def get_vectorstore(index_name="langchain-demo",
     else:
         index = pinecone.Index(index_name)
         vectorstore = Pinecone(index, embeddings.embed_query, "text")
+    return vectorstore
+
+
+def _init_pgvector(embeddings,
+                   collection_name: str,
+                   connection_string: str,
+                   add_docs: bool = False,
+                   pre_delete_collection: bool = True,
+                   docs_dir: str = './data',
+                   docs_ending: str = "txt", ):
+    if add_docs:
+        chunks = load_docs_and_generate_chunks(docs_dir=docs_dir,
+                                               docs_ending=docs_ending)
+
+        vectorstore = PGVector.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            collection_name=collection_name,
+            connection_string=connection_string,
+            pre_delete_collection=pre_delete_collection,
+        )
+    else:
+        vectorstore = PGVector(
+            collection_name=collection_name,
+            connection_string=connection_string,
+            embedding_function=embeddings,
+        )
+    return vectorstore
+
+
+def get_vectorstore(vector_db_cls: Type[VectorStore],
+                    vector_db_params: dict,
+                    embeddings_cls=HuggingFaceEmbeddings
+                    ):
+    embeddings = embeddings_cls()
+
+    if vector_db_cls == Pinecone:
+        vectorstore = _init_pinecone(embeddings, **vector_db_params)
+    elif vector_db_cls == PGVector:
+        vectorstore = _init_pgvector(embeddings, **vector_db_params)
+    else:
+        raise ValueError("supported vector stores: Pinecone, PGVector")
 
     return vectorstore
 
@@ -105,36 +147,45 @@ def get_vectorstore(index_name="langchain-demo",
 if __name__ == '__main__':
     logging.basicConfig(encoding='utf-8', level=logging.INFO)
 
-
-
-    st.title('PP help')
+    st.title('Local help')
     st.write("""
     I will have an answer to all of your questions. They might not be correct though."""
              )
 
-    load_dotenv(find_dotenv())
-    pinecone_env = os.getenv("PINECONE_ENV")
-    pinecone_api_key = os.getenv("PINECONE_API_KEY")
+    # pinecone_env = st.text_input("pinecone environment",
+    #                             value=pinecone_env if pinecone_env else "")
+    # pinecone_api_key = st.text_input("pinecone api key",
+    #                                 type="password",
+    #                                 value=pinecone_api_key if pinecone_api_key else "")
 
-    pinecone_env = st.text_input("pinecone environment",
-                                 value=pinecone_env if pinecone_env else "")
-    pinecone_api_key = st.text_input("pinecone api key",
-                                     type="password",
-                                     value=pinecone_api_key if pinecone_api_key else "")
-
-    model_name = st.text_input("GPT4All model name (available models can be found here : https://gpt4all.io/models/models.json)",
-                              value="ggml-model-gpt4all-falcon-q4_0.bin")
+    model_name = st.text_input(
+        "GPT4All model name (available models can be found here : https://gpt4all.io/models/models.json)",
+        value="ggml-model-gpt4all-falcon-q4_0.bin")
     query = st.text_area("Ask your PoolParty Question:")
 
-    #todo this loads the model and the db every time a request is set
+    # todo this loads the model and the db every time a request is set
     if st.button("Run"):
         # pinecone vectorstore
-        vectorstore = get_vectorstore(index_name="langchain-demo",
-                                      embeddings_cls=HuggingFaceEmbeddings,  # Embeddings / Document retrieval model
-                                      add_docs=False,
-                                      # change here for True if your documents are not yet in the vector store
-                                      pinecone_env=pinecone_env,
-                                      pinecone_key=pinecone_api_key)
+        load_dotenv(find_dotenv())
+        pinecone_env = os.getenv("PINECONE_ENV")
+        pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        pinecone_params = {
+            "index_name": "langchain-demo",
+            "add_docs": False,  # change here for True if your documents are not yet in the vector store
+            "pinecone_env": pinecone_env,
+            "pinecone_api_key": pinecone_api_key
+        }
+        ## pgvector vectorstore
+        #pgvector_connection_string = os.getenv("PINECONE_ENV")
+        #pgvector_params = {
+        #    "collection_name": "langchain-demo",
+        #    "add_docs": True,  # change here for True if your documents are not yet in the vector store
+        #    "pgvector_connection_string": pgvector_connection_string
+        #}
+        vectorstore = get_vectorstore(
+            vector_db_cls=Pinecone,
+            vector_db_params=pinecone_params,
+            embeddings_cls=HuggingFaceEmbeddings)  # Embeddings / Document retrieval model
         # generative model
         llm = get_llm("ggml-model-gpt4all-falcon-q4_0.bin")
 
