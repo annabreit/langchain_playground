@@ -1,6 +1,7 @@
+import copy
 import logging
 import os
-from typing import Type
+from typing import Type, Iterable, List, Optional
 
 import pinecone
 import streamlit as st
@@ -10,7 +11,7 @@ from langchain.chains import RetrievalQA
 from langchain.document_loaders import TextLoader, DirectoryLoader
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.llms import GPT4All as lang_GPT4All
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
 from langchain.vectorstores import Pinecone, VectorStore
 from langchain.vectorstores.pgvector import PGVector
 
@@ -36,8 +37,10 @@ def download_model(model_name: str, target_folder: str):
 
 def get_llm(model_name, model_path="./models"):
     local_path = (model_path + "/" + model_name)
+    logging.info(f"using model located at {local_path}")
 
     if not os.path.exists(local_path):
+        logging.info(f"downloading model to {local_path}")
         download_model(model_name, model_path)
 
     # Callbacks support token-wise streaming
@@ -45,6 +48,33 @@ def get_llm(model_name, model_path="./models"):
 
     # Verbose is required to pass to the callback manager
     return lang_GPT4All(model=local_path, callbacks=callbacks)
+
+
+def create_documents(
+        splitter, texts: List[str], metadatas: Optional[List[dict]] = None
+) -> List[Document]:
+    _metadatas = metadatas or [{}] * len(texts)
+    documents = []
+    for i, text in enumerate(texts):
+        index = -1
+        for doc in splitter.split_text(text):
+            metadata = copy.deepcopy(_metadatas[i])
+            metadata.update(doc.metadata)
+            # if splitter._add_start_index:
+            if True:
+                index = text.find(doc.page_content, index + 1)
+                metadata["start_index"] = index
+            new_doc = Document(page_content=doc.page_content, metadata=metadata)
+            documents.append(new_doc)
+    return documents
+
+
+def split_documents(splitter, documents: Iterable[Document]) -> List[Document]:
+    texts, metadatas = [], []
+    for doc in documents:
+        texts.append(doc.page_content)
+        metadatas.append(doc.metadata)
+    return create_documents(splitter, texts, metadatas=metadatas)
 
 
 def load_docs_and_generate_chunks(docs_dir='./data',
@@ -55,13 +85,32 @@ def load_docs_and_generate_chunks(docs_dir='./data',
                              loader_cls=TextLoader)
     documents = loader.load()
 
-    text_splitter = RecursiveCharacterTextSplitter(
+    # text_splitter = RecursiveCharacterTextSplitter(
+    #    chunk_size=1000,
+    #    chunk_overlap=20,
+    #    length_function=len,
+    #    add_start_index=True,
+    # )
+    # return text_splitter.split_documents(documents)
+
+    headers_to_split_on = [
+        ('#', "Header 1"),
+        ('##', "Header 2"),
+        ('###', "Header 3")
+    ]
+
+    from langchain.text_splitter import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter, Language
+    markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on)
+    md_header_splits = split_documents(markdown_splitter, documents)
+
+    text_splitter = RecursiveCharacterTextSplitter.from_language(
+        language=Language.MARKDOWN,
         chunk_size=1000,
         chunk_overlap=20,
         length_function=len,
-        add_start_index=True,
+        add_start_index=True
     )
-    return text_splitter.split_documents(documents)
+    return text_splitter.split_documents(md_header_splits)
 
 
 def _init_pinecone(embeddings,
@@ -103,7 +152,7 @@ def _init_pinecone(embeddings,
 
 def _init_pgvector(embeddings,
                    collection_name: str,
-                   connection_string: str,
+                   pgvector_connection_string: str,
                    add_docs: bool = False,
                    pre_delete_collection: bool = True,
                    docs_dir: str = './data',
@@ -116,13 +165,13 @@ def _init_pgvector(embeddings,
             documents=chunks,
             embedding=embeddings,
             collection_name=collection_name,
-            connection_string=connection_string,
+            connection_string=pgvector_connection_string,
             pre_delete_collection=pre_delete_collection,
         )
     else:
         vectorstore = PGVector(
             collection_name=collection_name,
-            connection_string=connection_string,
+            connection_string=pgvector_connection_string,
             embedding_function=embeddings,
         )
     return vectorstore
@@ -130,9 +179,10 @@ def _init_pgvector(embeddings,
 
 def get_vectorstore(vector_db_cls: Type[VectorStore],
                     vector_db_params: dict,
-                    embeddings_cls=HuggingFaceEmbeddings
+                    embeddings_cls=HuggingFaceEmbeddings,
+                    embedding_model_name="models/sentence_transformer"
                     ):
-    embeddings = embeddings_cls()
+    embeddings = embeddings_cls(model_name=embedding_model_name)
 
     if vector_db_cls == Pinecone:
         vectorstore = _init_pinecone(embeddings, **vector_db_params)
@@ -160,8 +210,8 @@ if __name__ == '__main__':
 
     model_name = st.text_input(
         "GPT4All model name (available models can be found here : https://gpt4all.io/models/models.json)",
-        value="ggml-model-gpt4all-falcon-q4_0.bin")
-    query = st.text_area("Ask your PoolParty Question:")
+        value="ggml-llama-2-7b.ggmlv3.q4_0.bin")
+    query = st.text_area("Ask your Question:")
 
     # todo this loads the model and the db every time a request is set
     if st.button("Run"):
@@ -176,18 +226,18 @@ if __name__ == '__main__':
             "pinecone_api_key": pinecone_api_key
         }
         ## pgvector vectorstore
-        #pgvector_connection_string = os.getenv("PINECONE_ENV")
-        #pgvector_params = {
+        # pgvector_connection_string = os.getenv("PGVECTOR_CONNECTION_STRING")
+        # pgvector_params = {
         #    "collection_name": "langchain-demo",
         #    "add_docs": True,  # change here for True if your documents are not yet in the vector store
         #    "pgvector_connection_string": pgvector_connection_string
-        #}
+        # }
         vectorstore = get_vectorstore(
             vector_db_cls=Pinecone,
             vector_db_params=pinecone_params,
             embeddings_cls=HuggingFaceEmbeddings)  # Embeddings / Document retrieval model
         # generative model
-        llm = get_llm("ggml-model-gpt4all-falcon-q4_0.bin")
+        llm = get_llm(model_name)
 
         # qa chain: retrieves
         qa_chain = RetrievalQA.from_chain_type(llm,
